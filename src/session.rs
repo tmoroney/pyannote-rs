@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use eyre::Result;
-use ort::{GraphOptimizationLevel, Session};
+use ort::session::{builder::GraphOptimizationLevel, Session};
 
 pub fn create_session<P: AsRef<Path>>(path: P) -> Result<Session> {
     let session = Session::builder()?
