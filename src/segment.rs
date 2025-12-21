@@ -1,6 +1,7 @@
 use crate::session;
 use eyre::{Context, ContextCompat, Result};
 use ndarray::{ArrayBase, Axis, IxDyn, ViewRepr};
+use std::iter;
 use std::{cmp::Ordering, collections::VecDeque, path::Path};
 
 #[derive(Debug, Clone)]
@@ -36,23 +37,40 @@ pub fn get_segments<P: AsRef<Path>>(
     let frame_size = 270;
     let frame_start = 721;
     let window_size = (sample_rate * 10) as usize; // 10 seconds
-    let mut is_speeching = false;
-    let mut offset = frame_start;
-    let mut start_offset = 0.0;
+    let overlap_size = sample_rate as usize;
+    let step_size = window_size.saturating_sub(overlap_size);
+
+    let gap_tolerance_frames = 5usize;
+    let min_segment_duration_ms = 150f64;
+    let start_hysteresis_ms = 500f64;
+    let start_hysteresis_frames = (((sample_rate as f64 * start_hysteresis_ms / 1000.0)
+        / frame_size as f64)
+        .max(1.0)
+        .round()) as usize;
+
+    let mut in_speech_segment = false;
+    let mut seg_start_samples: usize = 0;
+    let mut silence_frame_count: usize = 0;
+    let mut last_emitted_offset: usize = 0;
+    let mut speech_run: usize = 0;
 
     // Pad end with silence for full last segment
     let padded_samples = {
         let mut padded = Vec::from(samples);
-        padded.extend(vec![0; window_size - (samples.len() % window_size)]);
+        padded.extend(vec![0; window_size]);
         padded
     };
 
-    let mut start_iter = (0..padded_samples.len()).step_by(window_size);
+    let mut start_iter = (0..samples.len()).step_by(step_size.max(1));
 
     let mut segments_queue = VecDeque::new();
-    Ok(std::iter::from_fn(move || {
+    Ok(iter::from_fn(move || loop {
+        if let Some(segment) = segments_queue.pop_front() {
+            return Some(Ok(segment));
+        }
+
         if let Some(start) = start_iter.next() {
-            let end = (start + window_size).min(padded_samples.len());
+            let end = start + window_size;
             let window = &padded_samples[start..end];
 
             // Convert window to ndarray::Array1
@@ -60,9 +78,13 @@ pub fn get_segments<P: AsRef<Path>>(
             let array = array.view().insert_axis(Axis(0)).insert_axis(Axis(1));
 
             // Handle potential errors during the session and input processing
-            let inputs = ort::inputs![ort::value::TensorRef::from_array_view(array.into_dyn())
-                .map_err(|e| eyre::eyre!("Failed to prepare inputs: {:?}", e))
-                .ok()?];
+            let tensor = match ort::value::TensorRef::from_array_view(array.into_dyn()) {
+                Ok(tensor) => tensor,
+                Err(e) => {
+                    return Some(Err(eyre::eyre!("Failed to prepare inputs: {:?}", e)));
+                }
+            };
+            let inputs = ort::inputs![tensor];
 
             let ort_outs = match session.run(inputs) {
                 Ok(outputs) => outputs,
@@ -89,43 +111,88 @@ pub fn get_segments<P: AsRef<Path>>(
                 ndarray::ArrayViewD::<f32>::from_shape(ndarray::IxDyn(&shape_slice), data).unwrap();
 
             for row in view.outer_iter() {
-                for sub_row in row.axis_iter(Axis(0)) {
+                for (frame_idx, sub_row) in row.axis_iter(Axis(0)).into_iter().enumerate() {
                     let max_index = match find_max_index(sub_row) {
                         Ok(index) => index,
                         Err(e) => return Some(Err(e)),
                     };
 
-                    if max_index != 0 {
-                        if !is_speeching {
-                            start_offset = offset as f64;
-                            is_speeching = true;
-                        }
-                    } else if is_speeching {
-                        let start = start_offset / sample_rate as f64;
-                        let end = offset as f64 / sample_rate as f64;
-
-                        let start_f64 = start * (sample_rate as f64);
-                        let end_f64 = end * (sample_rate as f64);
-
-                        // Ensure indices are within bounds
-                        let start_idx = start_f64.min((samples.len() - 1) as f64) as usize;
-                        let end_idx = end_f64.min(samples.len() as f64) as usize;
-
-                        let segment_samples = &padded_samples[start_idx..end_idx];
-
-                        is_speeching = false;
-
-                        let segment = Segment {
-                            start,
-                            end,
-                            samples: segment_samples.to_vec(),
-                        };
-                        segments_queue.push_back(segment);
+                    let abs_offset = start + frame_start + frame_idx * frame_size;
+                    if abs_offset <= last_emitted_offset {
+                        continue;
                     }
-                    offset += frame_size;
+
+                    let is_speech = max_index != 0;
+                    if is_speech {
+                        silence_frame_count = 0;
+                        speech_run += 1;
+
+                        if !in_speech_segment && speech_run >= start_hysteresis_frames {
+                            let first_abs_offset =
+                                abs_offset.saturating_sub((speech_run - 1) * frame_size);
+                            seg_start_samples = first_abs_offset;
+                            in_speech_segment = true;
+                        }
+                    } else {
+                        speech_run = 0;
+                        if in_speech_segment {
+                            silence_frame_count += 1;
+                            if silence_frame_count >= gap_tolerance_frames {
+                                let end_idx = abs_offset.min(samples.len());
+                                let start_idx = seg_start_samples.min(end_idx);
+                                let segment_duration_ms =
+                                    ((end_idx.saturating_sub(start_idx)) as f64) * 1000.0
+                                        / sample_rate as f64;
+
+                                if segment_duration_ms >= min_segment_duration_ms
+                                    && start_idx < end_idx
+                                {
+                                    let start_sec = start_idx as f64 / sample_rate as f64;
+                                    let end_sec = end_idx as f64 / sample_rate as f64;
+                                    let segment_samples = &samples[start_idx..end_idx];
+
+                                    segments_queue.push_back(Segment {
+                                        start: start_sec,
+                                        end: end_sec,
+                                        samples: segment_samples.to_vec(),
+                                    });
+                                }
+
+                                in_speech_segment = false;
+                                silence_frame_count = 0;
+                            }
+                        }
+                    }
+
+                    last_emitted_offset = abs_offset;
                 }
             }
+
+            continue;
         }
-        segments_queue.pop_front().map(Ok)
+
+        if in_speech_segment {
+            let start_idx = seg_start_samples.min(samples.len());
+            let end_idx = last_emitted_offset.min(samples.len());
+            if end_idx > start_idx {
+                let segment_duration_ms =
+                    ((end_idx - start_idx) as f64) * 1000.0 / sample_rate as f64;
+                if segment_duration_ms >= min_segment_duration_ms {
+                    let start_sec = start_idx as f64 / sample_rate as f64;
+                    let end_sec = end_idx as f64 / sample_rate as f64;
+                    let segment_samples = &samples[start_idx..end_idx];
+                    segments_queue.push_back(Segment {
+                        start: start_sec,
+                        end: end_sec,
+                        samples: segment_samples.to_vec(),
+                    });
+                }
+            }
+
+            in_speech_segment = false;
+            continue;
+        }
+
+        return None;
     }))
 }
