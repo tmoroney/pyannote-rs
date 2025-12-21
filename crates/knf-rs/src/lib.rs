@@ -6,10 +6,15 @@ pub fn compute_fbank(samples: &[f32]) -> Result<Array2<f32>> {
         bail!("The samples array is empty. No features to compute.")
     }
 
+    // Scale samples by 32768 to match WeSpeaker's preprocessing
+    // Source: https://github.com/wenet-e2e/wespeaker/blob/master/wespeaker/bin/infer_onnx.py
+    // note: 1 << 15
+    let scaled_samples: Vec<f32> = samples.iter().map(|&x| x * 32768.0).collect();
+
     let mut result = unsafe {
         knf_rs_sys::ComputeFbank(
-            samples.as_ptr(),
-            samples.len().try_into().context("samples len")?,
+            scaled_samples.as_ptr(),
+            scaled_samples.len().try_into().context("samples len")?,
         )
     };
 

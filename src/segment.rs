@@ -84,14 +84,16 @@ pub fn get_segments<P: AsRef<Path>>(
                     return Some(Err(eyre::eyre!("Failed to prepare inputs: {:?}", e)));
                 }
             };
-            let inputs = ort::inputs![tensor];
+            let inputs = ort::inputs![
+                "input_values" => tensor
+            ];
 
             let ort_outs = match session.run(inputs) {
                 Ok(outputs) => outputs,
                 Err(e) => return Some(Err(eyre::eyre!("Failed to run the session: {:?}", e))),
             };
 
-            let ort_out = match ort_outs.get("output").context("Output tensor not found") {
+            let ort_out = match ort_outs.get("logits").context("Output tensor not found") {
                 Ok(output) => output,
                 Err(e) => return Some(Err(eyre::eyre!("Output tensor error: {:?}", e))),
             };
