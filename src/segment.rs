@@ -1,6 +1,7 @@
 use crate::session;
 use eyre::{Context, ContextCompat, Result};
 use ndarray::{ArrayBase, Axis, IxDyn, ViewRepr};
+use ort::value::TensorRef;
 use std::iter;
 use std::{cmp::Ordering, collections::VecDeque, path::Path};
 
@@ -73,12 +74,13 @@ pub fn get_segments<P: AsRef<Path>>(
             let end = start + window_size;
             let window = &padded_samples[start..end];
 
-            // Convert window to ndarray::Array1
-            let array = ndarray::Array1::from_iter(window.iter().map(|&x| x as f32));
-            let array = array.view().insert_axis(Axis(0)).insert_axis(Axis(1));
+            let window_f32 = window.iter().map(|&x| x as f32).collect::<Vec<_>>();
 
             // Handle potential errors during the session and input processing
-            let tensor = match ort::value::TensorRef::from_array_view(array.into_dyn()) {
+            let tensor = match TensorRef::from_array_view((
+                [1usize, 1, window_f32.len()],
+                window_f32.as_slice(),
+            )) {
                 Ok(tensor) => tensor,
                 Err(e) => {
                     return Some(Err(eyre::eyre!("Failed to prepare inputs: {:?}", e)));

@@ -56,9 +56,13 @@ impl EmbeddingExtractor {
         let samples = &samples_f32;
 
         let features: Array2<f32> = knf_rs::compute_fbank(samples)?;
-        let features = features.insert_axis(ndarray::Axis(0)); // Add batch dimension
+        let (num_frames, num_bins) = features.dim();
+        let feature_values = features
+            .as_slice_memory_order()
+            .context("fbank features should be contiguous")?
+            .to_vec();
         let inputs = ort::inputs![
-            "fbank_features" => Tensor::from_array(features)?
+            "fbank_features" => Tensor::from_array(([1usize, num_frames, num_bins], feature_values))?
         ];
 
         let ort_outs = self.session.run(inputs)?;
